@@ -1,0 +1,14 @@
+// Unit tests for the public surface.
+from "std" import Suite, T, suiteInit, test, suiteRun, expectEqStr
+from "../index" import version
+
+fn versionString(t: *T) {
+    expectEqStr(t, version(), "0.1.0")
+}
+
+@entry fn main() -> i32 {
+    local s: Suite
+    suiteInit(&s)
+    test(&s, "version", versionString)
+    return suiteRun(&s)
+}

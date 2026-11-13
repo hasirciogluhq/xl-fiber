@@ -1,0 +1,185 @@
+// FiberContext semantics: run / runOne / runFor / poll / pollOne, stop and restart, timers, join, dispatch, recycling.
+// Imports the modules directly: xlc rc.6 loses closure types when a generic is reached through a module named `index`.
+from "std/testing" import Suite, T, suiteInit, test, suiteRun, expectEq, expectTrue
+from "../runtime" import FiberContext, Task, nowMs
+
+fn fifoAndYield(t: *T) {
+    local ctx := FiberContext()
+    local log: [i64; 6]
+    local n: usize = 0
+    local (rt, out, at) = (&ctx, &log[0], &n)       // move closures copy ids; shared state goes in by pointer
+    for id in 1..4 {
+        ctx.spawn(move || {
+            out[*at] = id
+            *at += 1
+            rt.yieldNow()
+            out[*at] = id * 10
+            *at += 1
+        })
+    }
+    expectEq(t, ctx.pending() as i64, 3)
+    expectEq(t, ctx.run() as i64, 6)              // three starts + three resumptions after yield
+    local want: [i64; 6] = [1, 2, 3, 10, 20, 30]
+    for v, i in log { expectEq(t, *v, want[i]) }
+    expectEq(t, ctx.pending() as i64, 0)
+    expectEq(t, ctx.run() as i64, 0)              // no work: returns at once
+}
+
+fn pollNeverBlocks(t: *T) {
+    local ctx := FiberContext()
+    local steps := 0
+    ctx.spawn(|| { steps++ })
+    ctx.spawn(|| { steps++ })
+    expectEq(t, ctx.pollOne() as i64, 1)
+    expectEq(t, steps, 1)
+    expectEq(t, ctx.poll() as i64, 1)
+    expectEq(t, ctx.poll() as i64, 0)
+
+    ctx.spawn(|| {
+        ctx.sleepFor(40)
+        steps++
+    })
+    expectEq(t, ctx.poll() as i64, 1)              // starts, then parks on the timer
+    local before := nowMs()
+    expectEq(t, ctx.poll() as i64, 0)              // timer not due: returns immediately
+    expectTrue(t, nowMs() - before < 20)
+    expectEq(t, ctx.runOne() as i64, 1)            // blocks until the timer fires
+    expectTrue(t, nowMs() - before >= 35)
+    expectEq(t, steps, 3)
+}
+
+fn stopAndRestart(t: *T) {
+    local ctx := FiberContext()
+    local ticks := 0
+    ctx.spawn(|| {
+        for i in 0..10 {
+            ticks++
+            if ticks == 4 { ctx.stop() }
+            ctx.yieldNow()
+        }
+    })
+    ctx.run()
+    expectTrue(t, ctx.stopped())
+    expectEq(t, ticks, 4)
+    expectEq(t, ctx.run() as i64, 0)               // stays stopped until restart
+    ctx.restart()
+    ctx.run()
+    expectEq(t, ticks, 10)
+    expectEq(t, ctx.pending() as i64, 0)
+}
+
+fn timersFireInDeadlineOrder(t: *T) {
+    local ctx := FiberContext()
+    local order: [i64; 3]
+    local n: usize = 0
+    local (rt, out, at) = (&ctx, &order[0], &n)
+    local start := nowMs()
+    for ms in [60, 20, 40] {
+        local d: i64 = *ms
+        ctx.spawn(move || {
+            rt.sleepFor(d)
+            out[*at] = d
+            *at += 1
+        })
+    }
+    ctx.run()
+    local took := nowMs() - start
+    expectEq(t, order[0], 20)
+    expectEq(t, order[1], 40)
+    expectEq(t, order[2], 60)
+    expectTrue(t, took >= 55 && took < 110)       // concurrent sleeps: ~60 ms, not 120
+}
+
+fn runForReturnsAtDeadline(t: *T) {
+    local ctx := FiberContext()
+    local finished := false
+    ctx.spawn(|| {
+        ctx.sleepFor(120)
+        finished = true
+    })
+    local start := nowMs()
+    ctx.runFor(30)
+    local took := nowMs() - start
+    expectTrue(t, took >= 25 && took < 100)
+    expectTrue(t, !finished)
+    expectEq(t, ctx.pending() as i64, 1)
+    ctx.run()
+    expectTrue(t, finished)
+}
+
+fn joinWaitsForChildren(t: *T) {
+    local ctx := FiberContext()
+    local total: i64 = 0
+    local joined: i64 = -1
+    ctx.spawn(|| {
+        local a := ctx.spawn(|| {
+            ctx.sleepFor(15)
+            total += 1
+        })
+        local b := ctx.spawn(|| {
+            ctx.sleepFor(5)
+            total += 10
+        })
+        a.join()
+        b.join()                                    // already done: returns at once
+        joined = total
+    })
+    ctx.run()
+    expectEq(t, joined, 11)
+}
+
+fn dispatchRunsInlineInsideFibers(t: *T) {
+    local ctx := FiberContext()
+    local trail: i64 = 0
+    ctx.dispatch(|| { trail = trail * 10 + 2 })    // outside: queued
+    ctx.spawn(|| {
+        trail = trail * 10 + 1
+        ctx.dispatch(|| { trail = trail * 10 + 3 })  // inside: runs now
+        local tp := &trail                         // outlives this closure: move + pointer, not a nested capture
+        ctx.post(move || { *tp = *tp * 10 + 5 })   // always queued
+        trail = trail * 10 + 4
+    })
+    ctx.run()
+    expectEq(t, trail, 21345)
+}
+
+fn finishedFibersAreRecycled(t: *T) {
+    local ctx := FiberContext()
+    ctx.stackSize = 32768
+    local sum: i64 = 0
+    for round in 0..100 {
+        for i in 0..100 { ctx.spawn(|| { sum += 1 }) }
+        ctx.run()
+    }
+    expectEq(t, sum, 10000)
+    expectEq(t, ctx.fiberCount() as i64, 100)      // 10 000 fibers ran on 100 stacks
+}
+
+fn thousandsOfLiveFibers(t: *T) {
+    local ctx := FiberContext()
+    ctx.stackSize = 16384
+    local wakes: i64 = 0
+    for i in 0..2000 {
+        ctx.spawn(|| {
+            for k in 0..5 { ctx.yieldNow() }
+            wakes++
+        })
+    }
+    expectEq(t, ctx.run() as i64, 2000 * 6)
+    expectEq(t, wakes, 2000)
+}
+
+@entry fn main() -> i32 {
+    local s: Suite
+    suiteInit(&s)
+    test(&s, "run is FIFO and yieldNow rotates", fifoAndYield)
+    test(&s, "poll and pollOne never block, runOne does", pollNeverBlocks)
+    test(&s, "stop parks the loop until restart", stopAndRestart)
+    test(&s, "timers fire in deadline order, concurrently", timersFireInDeadlineOrder)
+    test(&s, "runFor returns at its deadline", runForReturnsAtDeadline)
+    test(&s, "join waits for child tasks", joinWaitsForChildren)
+    test(&s, "dispatch runs inline inside a fiber", dispatchRunsInlineInsideFibers)
+    test(&s, "finished fibers are recycled", finishedFibersAreRecycled)
+    test(&s, "2000 live fibers", thousandsOfLiveFibers)
+    return suiteRun(&s)
+}

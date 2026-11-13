@@ -1,0 +1,29 @@
+// Raw context switching, the layer fibers are built on: `xl run examples/context.xl`.
+// A generator closure runs on its own stack and hands main one Fibonacci number per switch.
+from "std" import format
+from "../context" import Context              // direct imports: see the `index` bug in new-xl-features.md
+from "../stack" import Stack
+from "../log" import info, trace
+
+@entry fn main() -> i32 {
+    local main := Context()
+    local gen := Context()
+    local stack := Stack(65536)
+    local current: i64 = 0
+    gen.prepare(&stack, || {
+        local (a, b) = (0 as i64, 1 as i64)
+        while true {
+            current = a
+            gen.switchTo(&main)
+            local next := a + b
+            a = b
+            b = next
+        }
+    })
+    for i in 0..10 {
+        main.switchTo(&gen)
+        trace(format("fib({}) = {}", i, current).asStr())
+    }
+    info("done; the suspended generator's stack is unmapped when `stack` drops")
+    return 0
+}

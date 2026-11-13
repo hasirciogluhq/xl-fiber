@@ -1,0 +1,23 @@
+// Fiber stacks: mapped memory with a PROT_NONE guard page below, so an overflow faults instead of corrupting a neighbour.
+from "std" import panic
+from "std/sys" import sysMapGuarded, sysUnmapGuarded
+
+export define MIN_STACK_SIZE = 16384
+export define DEFAULT_STACK_SIZE = 262144
+
+export class Stack {
+    base: *void
+    size: usize
+
+    /// Maps at least `size` bytes, rounded up to whole pages. Panics when the kernel refuses.
+    fn init(self, size: usize) {
+        self.size = ((size < MIN_STACK_SIZE ? MIN_STACK_SIZE : size) + 4095) & ~(4095 as usize)
+        self.base = sysMapGuarded(self.size)
+        if self.base == nil { panic("xl-fiber: cannot map a fiber stack") }
+    }
+
+    /// One past the highest usable byte; 16-byte aligned. Stacks grow down from here.
+    fn top(self) -> usize { return self.base as usize + self.size }
+
+    fn drop(self) { sysUnmapGuarded(self.base, self.size) }
+}

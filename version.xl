@@ -1,0 +1,2 @@
+// The library version, kept in step with the release tag.
+export fn version() -> str { return "0.1.0" }

@@ -1,0 +1,69 @@
+// Channel<T>: a bounded multi-producer multi-consumer queue between fibers of one FiberContext (tokio::sync::mpsc, Go
+// channels). `send` suspends while the buffer is full, `recv` while it is empty; `close` wakes everyone.
+from "std/collections/option" import Option
+from "std/mem/mem" import currentAllocator
+from "runtime" import FiberContext, FiberQueue
+
+export class Channel<T> {
+    ctx: *FiberContext
+    slots: *T           // ring buffer
+    cap: usize
+    head: usize
+    len: usize
+    closed: bool
+    senders: FiberQueue
+    receivers: FiberQueue
+
+    /// A channel buffering up to `cap` values (at least 1).
+    fn init(self, ctx: *FiberContext, cap: usize) {
+        self.ctx = ctx
+        self.cap = cap == 0 ? 1 : cap
+        self.slots = currentAllocator.alloc(sizeOf(T) * self.cap, alignOf(T)) as *T
+        self.head = 0
+        self.len = 0
+        self.closed = false
+    }
+
+    fn drop(self) {
+        while self.len > 0 { local v: T = self.take() }
+        currentAllocator.free(self.slots as *void)
+    }
+
+    /// Queues `v`, suspending while the channel is full. False (and `v` dropped) once the channel is closed.
+    fn send(self, v: T) -> bool {
+        while self.len == self.cap && !self.closed { self.ctx.waitOn(&self.senders) }
+        if self.closed { return false }
+        __builtin_write(&self.slots[(self.head + self.len) % self.cap], v)
+        self.len++
+        self.ctx.wake(self.receivers.pop())
+        return true
+    }
+
+    /// The oldest value, suspending while the channel is empty. None once it is closed and drained.
+    fn recv(self) -> Option<T> {
+        while self.len == 0 {
+            if self.closed { return Option.None }
+            self.ctx.waitOn(&self.receivers)
+        }
+        local v: T = self.take()
+        self.ctx.wake(self.senders.pop())
+        return Option.Some(v)
+    }
+
+    /// No more sends; receivers still drain what is buffered.
+    fn close(self) {
+        self.closed = true
+        while !self.senders.isEmpty() { self.ctx.wake(self.senders.pop()) }
+        while !self.receivers.isEmpty() { self.ctx.wake(self.receivers.pop()) }
+    }
+
+    fn length(self) -> usize { return self.len }
+    fn isClosed(self) -> bool { return self.closed }
+
+    fn take(self) -> T {
+        local v: T = __builtin_read(&self.slots[self.head])
+        self.head = (self.head + 1) % self.cap
+        self.len--
+        return v
+    }
+}

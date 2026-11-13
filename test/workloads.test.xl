@@ -1,0 +1,175 @@
+// Real workloads on a FiberContext: a channel pipeline, a worker pool, and streaming over a non-blocking pipe.
+from "std/testing" import Suite, T, suiteInit, test, suiteRun, expectEq, expectTrue
+from "std/collections/option" import Option
+from "std/sys" import sysClose
+from "../runtime" import FiberContext, Task, nowMs, openPipe
+from "../channel" import Channel
+
+// producer -> square -> sum, with small buffers so every stage blocks on the others many times.
+fn pipeline(t: *T) {
+    local ctx := FiberContext()
+    local raw := Channel<i64>(&ctx, 4)
+    local squared := Channel<i64>(&ctx, 2)
+    local total: i64 = 0
+    ctx.spawn(|| {
+        for i in 1..=1000 { raw.send(i) }
+        raw.close()
+    })
+    ctx.spawn(|| {
+        while true {
+            switch raw.recv() {
+                case Option.Some(v) { squared.send(v * v) }
+                case Option.None { break }
+            }
+        }
+        squared.close()
+    })
+    ctx.spawn(|| {
+        while true {
+            switch squared.recv() {
+                case Option.Some(v) { total += v }
+                case Option.None { break }
+            }
+        }
+    })
+    ctx.run()
+    expectEq(t, total, 1000 * 1001 * 2001 / 6)
+    expectEq(t, ctx.pending() as i64, 0)
+}
+
+fn isPrime(n: i64) -> bool {
+    if n < 2 { return false }
+    for d in 2..n {
+        if d * d > n { break }
+        if n % d == 0 { return false }
+    }
+    return true
+}
+
+// 8 workers share a job queue of number ranges and report prime counts; main fiber fans in through `join`.
+fn workerPool(t: *T) {
+    local ctx := FiberContext()
+    local jobs := Channel<i64>(&ctx, 8)
+    local results := Channel<i64>(&ctx, 64)
+    local perWorker: [i64; 8]
+    local primes: i64 = 0
+    ctx.spawn(|| {
+        local workers: [Task; 8]
+        local (rt, jobq, out, tally) = (&ctx, &jobs, &results, &perWorker[0])
+        for w in 0..8 {
+            perWorker[w] = 0
+            workers[w] = ctx.spawn(move || {           // move: each worker keeps its own `w`
+                while true {
+                    switch jobq.recv() {
+                        case Option.Some(start) {
+                            local count: i64 = 0
+                            for n in start..start + 1000 { if isPrime(n) { count++ } }
+                            out.send(count)
+                            tally[w] += 1
+                            rt.yieldNow()               // be fair to the other workers
+                        }
+                        case Option.None { break }
+                    }
+                }
+            })
+        }
+        for chunk in 0..20 { jobs.send(chunk * 1000) }
+        jobs.close()
+        for w in workers { w.join() }
+        results.close()
+        while true {
+            switch results.recv() {
+                case Option.Some(c) { primes += c }
+                case Option.None { break }
+            }
+        }
+    })
+    ctx.run()
+    expectEq(t, primes, 2262)                        // primes below 20 000
+    for c in perWorker { expectTrue(t, *c > 0) }     // the work really was shared
+}
+
+// Streams 256 KiB through a 16 KiB-ish kernel pipe buffer: the writer parks on writability, the reader on readability.
+fn pipeStreaming(t: *T) {
+    local ctx := FiberContext()
+    local fds: [i32; 2]
+    if !openPipe(&fds[0]) {
+        expectTrue(t, false)
+        return
+    }
+    local sent: i64 = 0
+    local received: i64 = 0
+    local checksum: u64 = 0
+    local expected: u64 = 0
+    ctx.spawn(|| {
+        local block: [u8; 4096]
+        for round in 0..64 {
+            for b, i in block {
+                *b = ((round * 31 + i as i64) & 0xff) as u8
+                expected = expected * 131 + *b as u64
+            }
+            sent += ctx.write(fds[1], &block[0], 4096) as i64
+        }
+        sysClose(fds[1])
+    })
+    ctx.spawn(|| {
+        local buf: [u8; 1500]
+        while true {
+            local r := ctx.read(fds[0], &buf[0], 1500)
+            if r <= 0 { break }
+            for i in 0..r as usize { checksum = checksum * 131 + buf[i] as u64 }
+            received += r as i64
+        }
+        sysClose(fds[0])
+    })
+    ctx.run()
+    expectEq(t, sent, 262144)
+    expectEq(t, received, 262144)
+    expectTrue(t, checksum == expected)
+}
+
+// A heartbeat timer and a busy channel conversation interleave on one thread.
+fn timersAndIoTogether(t: *T) {
+    local ctx := FiberContext()
+    local beats := 0
+    local messages := 0
+    local done := false
+    local ch := Channel<i64>(&ctx, 1)
+    ctx.spawn(|| {
+        while !done {
+            ctx.sleepFor(10)
+            beats++
+        }
+    })
+    ctx.spawn(|| {
+        for i in 0..50 {
+            ch.send(i)
+            ctx.sleepFor(1)
+        }
+        ch.close()
+    })
+    ctx.spawn(|| {
+        while true {
+            switch ch.recv() {
+                case Option.Some(v) { messages++ }
+                case Option.None { break }
+            }
+        }
+        done = true
+    })
+    local start := nowMs()
+    ctx.run()
+    expectEq(t, messages, 50)
+    expectTrue(t, beats >= 3)
+    expectTrue(t, nowMs() - start < 1000)
+}
+
+@entry fn main() -> i32 {
+    local s: Suite
+    suiteInit(&s)
+    test(&s, "three-stage channel pipeline", pipeline)
+    test(&s, "worker pool counts primes", workerPool)
+    test(&s, "256 KiB through a non-blocking pipe", pipeStreaming)
+    test(&s, "timers and channels interleave", timersAndIoTogether)
+    return suiteRun(&s)
+}

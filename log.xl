@@ -1,0 +1,23 @@
+// Runtime diagnostics: tagged, colored lines on standard output (plain when xl-color detects NO_COLOR, TERM=dumb or a pipe).
+from "std" import println, format
+from "github.com/hasirciogluhq/xl-color" import cyan, yellow, red, gray
+
+export fn info(msg: str) {
+    local tag = cyan("[fiber]")
+    println(format("{} {}", &tag, msg).asStr())
+}
+
+export fn warn(msg: str) {
+    local tag = yellow("[fiber]")
+    println(format("{} {}", &tag, msg).asStr())
+}
+
+export fn error(msg: str) {
+    local tag = red("[fiber]")
+    println(format("{} {}", &tag, msg).asStr())
+}
+
+export fn trace(msg: str) {
+    local line = gray(format("[fiber] {}", msg).asStr())
+    println(line.asStr())
+}

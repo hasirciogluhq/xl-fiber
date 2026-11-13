@@ -1,0 +1,392 @@
+// FiberContext: a single-threaded executor and I/O reactor, the xl-fiber counterpart of asio's io_context / tokio's
+// current-thread runtime. `spawn` starts a fiber; `run`, `runOne`, `runFor`, `poll` and `pollOne` drive them. Fibers suspend
+// on `yieldNow`, `sleepFor`, I/O readiness (kqueue / epoll / WSAPoll), `Task.join` and channels. Finished fibers' stacks
+// are pooled.
+from "std" import panic
+from "std/collections/vec" import Vec
+from "std/sys" import sysPollCreate, sysPollWatch, sysPollWait, sysClose, sysRead, sysWrite, sysClockNanos, sysPipe
+from "context" import Context, stackPlace
+from "stack" import Stack, DEFAULT_STACK_SIZE
+
+// WOULD_BLOCK: what std's sysRead / sysWrite return when a non-blocking descriptor is not ready.
+#if os == "windows"
+define WOULD_BLOCK = -1                       // NtReadFile on an empty PIPE_NOWAIT pipe; std maps errors to -1
+@library("kernel32") declare fn Sleep(ms: u32)
+@library("kernel32") declare fn SetNamedPipeHandleState(h: i64, mode: *u32, maxCount: *u32, timeout: *u32) -> i32
+@library("kernel32") declare fn CreatePipe(read: *i64, write: *i64, attrs: *void, size: u32) -> i32
+#elif os == "macos"
+define WOULD_BLOCK = -35                      // -EAGAIN
+define SYS_FCNTL = 92
+define O_NONBLOCK = 0x4
+#elif arch == "x86_64"
+define WOULD_BLOCK = -11
+define SYS_FCNTL = 72
+define O_NONBLOCK = 0x800
+#else
+define WOULD_BLOCK = -11
+define SYS_FCNTL = 25
+define O_NONBLOCK = 0x800
+#endif
+
+/// Puts `fd` in non-blocking mode, which FiberContext.read / write need (a blocking fd stalls every fiber).
+/// Use it on pipes too: std rc.6 `sysPipe(fds, true)` leaves them blocking on macOS. On Windows it covers pipes.
+export fn setNonBlocking(fd: i32) -> bool {
+#if os == "windows"
+    local mode: u32 = 1                                   // PIPE_NOWAIT
+    return SetNamedPipeHandleState(fd as i64, &mode, nil, nil) != 0
+#else
+    local flags := syscall(SYS_FCNTL, fd, 3, 0)          // F_GETFL
+    return flags >= 0 && syscall(SYS_FCNTL, fd, 4, flags | O_NONBLOCK) >= 0   // F_SETFL
+#endif
+}
+
+/// A non-blocking pipe for FiberContext.read / write: `fds[0]` reads, `fds[1]` writes. False on failure.
+/// (std rc.6 `sysPipe` fails under Windows/Wine and leaves macOS pipes blocking.)
+export fn openPipe(fds: *i32) -> bool {
+#if os == "windows"
+    local r: i64 = 0
+    local w: i64 = 0
+    if CreatePipe(&r, &w, nil, 65536) == 0 { return false }
+    fds[0] = r as i32
+    fds[1] = w as i32
+#else
+    if sysPipe(fds, false) < 0 { return false }
+#endif
+    return setNonBlocking(fds[0]) && setNonBlocking(fds[1])
+}
+
+/// Milliseconds on the clock timers use.
+export fn nowMs() -> i64 { return sysClockNanos() / 1000000 }
+
+export class Fiber {
+    ctx: Context
+    stack: Stack
+    owner: *FiberContext
+    next: *Fiber       // link in exactly one FiberQueue at a time (ready, pool or a wait list)
+    joiner: *Fiber     // the fiber blocked in Task.join on this one
+    wake: i64          // timer deadline, ms
+    gen: u64           // bumped on reuse, so stale Task handles see "done"
+    done: bool
+
+    fn init(self, owner: *FiberContext, size: usize) {
+        self.ctx = Context()
+        self.stack = Stack(size)
+        self.owner = owner
+        self.next = nil
+        self.joiner = nil
+        self.gen = 0
+        self.done = true
+    }
+}
+
+/// Intrusive FIFO of fibers: no allocation, O(1) push and pop.
+export struct FiberQueue { head: *Fiber, tail: *Fiber }
+
+impl FiberQueue {
+    fn push(self: *FiberQueue, fb: *Fiber) {
+        fb.next = nil
+        if self.tail == nil { self.head = fb } else { self.tail.next = fb }
+        self.tail = fb
+    }
+    fn pop(self: *FiberQueue) -> *Fiber {
+        local fb := self.head
+        if fb != nil {
+            self.head = fb.next
+            if self.head == nil { self.tail = nil }
+        }
+        return fb
+    }
+    fn isEmpty(self: *FiberQueue) -> bool { return self.head == nil }
+}
+
+/// A handle to a spawned fiber.
+export struct Task { owner: *FiberContext, fiber: *Fiber, gen: u64 }
+
+impl Task {
+    fn done(self: *Task) -> bool { return self.fiber.gen != self.gen || self.fiber.done }
+
+    /// Suspends the calling fiber until this task has finished. One joiner per task.
+    fn join(self: *Task) {
+        if self.done() { return }
+        self.fiber.joiner = self.owner.running()
+        self.owner.park()
+    }
+}
+
+/// Runs a spawned closure on its fiber, drops it (releasing what it captured), then retires the fiber.
+fn fiberMain<F>(p: *void) {
+    local fb := p as *Fiber
+    {
+        local f: F = __builtin_read(((fb.stack.top() - sizeOf(F)) & ~(15 as usize)) as *F)
+        f()
+    }
+    fb.owner.finish()
+}
+
+export class FiberContext {
+    sched: Context            // the run loop's own context
+    ready: FiberQueue
+    pool: FiberQueue          // finished fibers, stacks ready for reuse
+    timers: Vec<*Fiber>       // min-heap on `wake`
+    fibers: Vec<*Fiber>       // every fiber this context owns
+    current: *Fiber
+    stackSize: usize          // for fibers created from now on
+    live: usize               // spawned and not yet finished
+    ioWaiting: usize
+    halted: bool
+    poller: i32
+
+    fn init(self) {
+        self.sched = Context()
+        self.timers = Vec<*Fiber>()
+        self.fibers = Vec<*Fiber>()
+        self.stackSize = DEFAULT_STACK_SIZE
+        self.poller = sysPollCreate()
+        if self.poller < 0 { panic("xl-fiber: cannot create the I/O poller") }
+    }
+
+    fn drop(self) {
+        for fb in self.fibers { delete *fb }
+        sysClose(self.poller)
+    }
+
+    // ---- driving the context (asio: run, run_one, run_for, run_until, poll, poll_one) --------------------------------
+
+    /// Runs fibers until none is left (or none can ever wake) or `stop` is called. Returns how many resumptions ran.
+    fn run(self) -> usize { return self.drive(-1, false) }
+
+    /// Runs at most one resumption, blocking until one is ready. 0 when there is no work or the context is stopped.
+    fn runOne(self) -> usize { return self.drive(-1, true) }
+
+    /// `run` for at most `ms` milliseconds.
+    fn runFor(self, ms: i64) -> usize { return self.drive(nowMs() + ms, false) }
+
+    /// `run` until the clock reaches `deadline` (ms on the `nowMs` clock).
+    fn runUntil(self, deadline: i64) -> usize { return self.drive(deadline, false) }
+
+    /// Runs every fiber that is ready now, including timers and I/O that are already due, without blocking.
+    fn poll(self) -> usize { return self.drive(0, false) }
+
+    /// `poll`, but at most one resumption.
+    fn pollOne(self) -> usize { return self.drive(0, true) }
+
+    /// Makes `run` and friends return as soon as the running fiber suspends. Pending fibers stay pending.
+    fn stop(self) { self.halted = true }
+    fn stopped(self) -> bool { return self.halted }
+    /// Clears `stop` so the context can be run again.
+    fn restart(self) { self.halted = false }
+
+    /// Fibers spawned and not finished yet (asio's outstanding work).
+    fn pending(self) -> usize { return self.live }
+    /// Fibers ever allocated; stays small while finished fibers are recycled.
+    fn fiberCount(self) -> usize { return self.fibers.length() }
+    /// Whether the caller runs on one of this context's fibers.
+    fn inFiber(self) -> bool { return self.current != nil }
+
+    // ---- inside a fiber -----------------------------------------------------------------------------------------------
+
+    /// Lets the other ready fibers run first.
+    fn yieldNow(self) {
+        self.ready.push(self.running())
+        self.park()
+    }
+
+    fn sleepFor(self, ms: i64) { self.sleepUntil(nowMs() + ms) }
+
+    fn sleepUntil(self, deadline: i64) {
+        local fb := self.running()
+        fb.wake = deadline
+        self.timerPush(fb)
+        self.park()
+    }
+
+    /// Suspends until `fd` is readable (or writable). False when the poller refuses the descriptor.
+    fn waitReadable(self, fd: i32) -> bool { return self.waitIo(fd, false) }
+    fn waitWritable(self, fd: i32) -> bool { return self.waitIo(fd, true) }
+
+    /// Reads from a non-blocking descriptor, suspending the fiber while no data is available. Bytes read, 0 at end of
+    /// file, negative on error.
+    fn read(self, fd: i32, buf: *u8, n: usize) -> isize {
+        while true {
+            local r := sysRead(fd, buf, n)
+            if r != WOULD_BLOCK { return r }
+            self.awaitIo(fd, false)
+        }
+        return 0
+    }
+
+    /// Writes all `n` bytes to a non-blocking descriptor, suspending while it is full. Bytes written or negative on error.
+    fn write(self, fd: i32, buf: *u8, n: usize) -> isize {
+        local done: usize = 0
+        while done < n {
+            local r := sysWrite(fd, (buf as usize + done) as *u8, n - done)
+            if r == WOULD_BLOCK || r == 0 {             // a full PIPE_NOWAIT pipe on Windows accepts 0 bytes
+                self.awaitIo(fd, true)
+            } else if r < 0 {
+                return r
+            } else {
+                done += r as usize
+            }
+        }
+        return done as isize
+    }
+
+    // ---- building blocks for synchronisation primitives ---------------------------------------------------------------
+
+    /// The fiber that is running; panics outside a fiber.
+    fn running(self) -> *Fiber {
+        if self.current == nil { panic("xl-fiber: this operation must run inside a fiber") }
+        return self.current
+    }
+
+    /// Suspends the running fiber until someone `wake`s it.
+    fn park(self) { self.running().ctx.switchTo(&self.sched) }
+
+    /// Suspends the running fiber on the wait list `q`.
+    fn waitOn(self, q: *FiberQueue) {
+        q.push(self.running())
+        self.park()
+    }
+
+    /// Makes a parked fiber ready again; nil is ignored.
+    fn wake(self, fb: *Fiber) {
+        if fb != nil { self.ready.push(fb) }
+    }
+
+    // ---- internals ----------------------------------------------------------------------------------------------------
+
+    fn finish(self) {
+        local fb := self.running()
+        fb.done = true
+        self.live--
+        self.wake(fb.joiner)
+        fb.joiner = nil
+        fb.ctx.switchTo(&self.sched)
+        panic("xl-fiber: a finished fiber was resumed")
+    }
+
+    fn acquire(self) -> *Fiber {
+        local fb := self.pool.pop()
+        if fb == nil {
+            fb = new Fiber(self, self.stackSize)
+            self.fibers.push(fb)
+        }
+        fb.gen++
+        fb.done = false
+        return fb
+    }
+
+    /// Waits for readiness; a descriptor the poller cannot watch (pipes on Windows, regular files) is retried after
+    /// the other fibers ran, or after 1 ms when none is ready.
+    fn awaitIo(self, fd: i32, write: bool) {
+        if self.waitIo(fd, write) { return }
+        if self.ready.isEmpty() { self.sleepFor(1) } else { self.yieldNow() }
+    }
+
+    /// Blocks for I/O events up to `timeout` ms (-1 forever); stores fiber tokens, returns how many.
+    fn waitEvents(self, tokens: *usize, timeout: i32) -> i32 {
+#if os == "windows"
+        if self.ioWaiting == 0 {                    // WSAPoll returns at once on an empty set: sleep for the timers
+            Sleep(timeout as u32)
+            return 0
+        }
+#endif
+        return sysPollWait(self.poller, tokens, 16, timeout)
+    }
+
+    fn waitIo(self, fd: i32, write: bool) -> bool {
+        local fb := self.running()
+        if sysPollWatch(self.poller, fd, write, fb as usize) < 0 { return false }
+        self.ioWaiting++
+        self.park()
+        return true
+    }
+
+    /// The run loop. `deadline` < 0 blocks as long as needed, 0 never blocks; `once` stops after one resumption.
+    fn drive(self, deadline: i64, once: bool) -> usize {
+        local count: usize = 0
+        while !self.halted && self.fill(deadline) {
+            local fb := self.ready.pop()
+            self.current = fb
+            self.sched.switchTo(&fb.ctx)
+            self.current = nil
+            if fb.done { self.pool.push(fb) }
+            count++
+            if once { break }
+        }
+        return count
+    }
+
+    /// Makes sure a fiber is ready, collecting due timers and I/O and waiting up to `deadline`. False when none will be.
+    fn fill(self, deadline: i64) -> bool {
+        local polled := false
+        while true {
+            local now := nowMs()
+            while self.timers.length() > 0 && (*self.timers.get(0)).wake <= now { self.ready.push(self.timerPop()) }
+            if !self.ready.isEmpty() { return true }
+            if self.timers.length() == 0 && self.ioWaiting == 0 { return false }
+            if polled && deadline >= 0 && now >= deadline { return false }
+            local until: i64 = self.timers.length() > 0 ? (*self.timers.get(0)).wake : -1
+            if deadline >= 0 && (until < 0 || deadline < until) { until = deadline }
+            local tokens: [usize; 16]
+            local n := self.waitEvents(&tokens[0], until < 0 ? -1 : (until > now ? (until - now) as i32 : 0))
+            for i in 0..n as usize {
+                self.ioWaiting--
+                self.ready.push(tokens[i] as *Fiber)
+            }
+            polled = true
+        }
+        return false
+    }
+
+    fn timerPush(self, fb: *Fiber) {
+        self.timers.push(fb)
+        local i := self.timers.length() - 1
+        while i > 0 {
+            local parent := *self.timers.get((i - 1) / 2)
+            if parent.wake <= fb.wake { break }
+            self.timers.set(i, parent)
+            i = (i - 1) / 2
+        }
+        self.timers.set(i, fb)
+    }
+
+    fn timerPop(self) -> *Fiber {
+        local top := *self.timers.get(0)
+        local last := self.timers.pop()
+        local n := self.timers.length()
+        if n > 0 {
+            local i: usize = 0
+            while true {
+                local c := 2 * i + 1
+                if c >= n { break }
+                if c + 1 < n && (*self.timers.get(c + 1)).wake < (*self.timers.get(c)).wake { c++ }
+                if last.wake <= (*self.timers.get(c)).wake { break }
+                self.timers.set(i, *self.timers.get(c))
+                i = c
+            }
+            self.timers.set(i, last)
+        }
+        return top
+    }
+}
+
+impl FiberContext {
+    /// Starts `f()` on a new (or recycled) fiber. It first runs when the context is driven.
+    fn spawn<F>(self: *FiberContext, f: F) -> Task {
+        local fb := self.acquire()
+        local entry: fn(*void) = fiberMain<F>
+        fb.ctx.start(&fb.stack, stackPlace(fb.stack.top(), f), entry, fb as *void)
+        self.live++
+        self.ready.push(fb)
+        return Task { owner: self, fiber: fb, gen: fb.gen }
+    }
+
+    /// Queues `f()` to run later on this context (asio post).
+    fn post<F>(self: *FiberContext, f: F) { self.spawn(f) }
+
+    /// Runs `f()` right away when called from one of this context's fibers, otherwise queues it (asio dispatch).
+    fn dispatch<F>(self: *FiberContext, f: F) {
+        if self.current != nil { f() } else { self.spawn(f) }
+    }
+}

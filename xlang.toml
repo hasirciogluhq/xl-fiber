@@ -1,0 +1,6 @@
+[package]
+name = "xl-fiber"
+description = "Asynchronous runtime for xlang: fibers, scheduling, timers and async I/O"
+
+[dependencies]
+"github.com/hasirciogluhq/xl-color" = "v0.1.3"

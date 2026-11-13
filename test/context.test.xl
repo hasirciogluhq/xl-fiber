@@ -1,0 +1,89 @@
+// Context switching: turn order, register-held locals across switches, deep recursion on a fiber stack.
+from "std/testing" import Suite, T, suiteInit, test, suiteRun, expectEq, expectTrue
+from "../context" import Context
+from "../stack" import Stack
+
+fn interleave(t: *T) {
+    local main := Context()
+    local co := Context()
+    local stack := Stack(65536)
+    expectEq(t, (stack.top() % 16) as i64, 0)
+    local trail: [i64; 7]
+    local n: usize = 0
+    co.prepare(&stack, || {
+        for step in 0..3 {
+            trail[n] = 2 * step + 1
+            n++
+            co.switchTo(&main)
+        }
+    })
+    for step in 0..3 {
+        trail[n] = 2 * step
+        n++
+        main.switchTo(&co)
+    }
+    trail[n] = 6
+    n++
+    for v, i in trail { expectEq(t, *v, i as i64) }
+}
+
+fn localsSurvive(t: *T) {
+    local main := Context()
+    local co := Context()
+    local stack := Stack(65536)
+    local noise: i64 = 0
+    co.prepare(&stack, || {
+        for k in 0..1000000 {
+            local x: f64 = (k as f64) * 1.5 + 0.25     // dirties integer and vector registers
+            noise += (x as i64) % 7
+            co.switchTo(&main)
+        }
+    })
+    local a: i64 = 11
+    local b: i64 = 0
+    local c: f64 = 3.25
+    for round in 0..1000 {
+        a++
+        c += 0.5
+        main.switchTo(&co)
+        b += a
+    }
+    expectEq(t, a, 1011)
+    expectEq(t, b, (12 + 1011) * 1000 / 2)
+    expectTrue(t, c == 503.25)
+    expectTrue(t, noise != 0)
+}
+
+fn depth(n: i64, here: *Context, back: *Context) -> i64 {
+    if n == 0 {
+        here.switchTo(back)
+        return 0
+    }
+    local pad: [i64; 8]
+    pad[0] = n
+    return depth(n - 1, here, back) + pad[0]
+}
+
+fn recursion(t: *T) {
+    local main := Context()
+    local co := Context()
+    local stack := Stack(262144)
+    local sum: i64 = -1
+    co.prepare(&stack, || {
+        sum = depth(500, &co, &main)
+        co.switchTo(&main)
+    })
+    main.switchTo(&co)          // parks at the bottom of the recursion
+    expectEq(t, sum, -1)
+    main.switchTo(&co)          // unwinds it
+    expectEq(t, sum, 500 * 501 / 2)
+}
+
+@entry fn main() -> i32 {
+    local s: Suite
+    suiteInit(&s)
+    test(&s, "switches interleave", interleave)
+    test(&s, "locals survive switches", localsSurvive)
+    test(&s, "recursion on a fiber stack", recursion)
+    return suiteRun(&s)
+}

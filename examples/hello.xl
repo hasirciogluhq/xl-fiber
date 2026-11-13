@@ -1,0 +1,9 @@
+// Smoke example: `xl run examples/hello.xl`.
+from "std" import format
+from "../index" import version, info, trace
+
+@entry fn main() -> i32 {
+    info(format("xl-fiber {}", version()).asStr())
+    trace("runtime not started yet")
+    return 0
+}

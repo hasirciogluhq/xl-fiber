@@ -1,0 +1,111 @@
+// Machine contexts, the lowest runtime layer (boost::context's fcontext). `a.switchTo(&b)` saves the running code into `a`
+// and continues `b`; it returns once something switches back to `a`. Only the ABI's callee-saved state is stored, everything
+// else is declared clobbered, so a switch costs about as much as a function call.
+// Targets: x86_64 System V and Win64, AArch64 AAPCS64 (Linux, macOS, Windows x64).
+from "std" import panic
+from "stack" import Stack
+
+// Word layout of Context.regs; the asm hard-codes the byte offsets (word * 8).
+//   0 sp | 1 fp | 2 resume pc | 3 first argument of a fresh context
+//   x86_64:  4 rbx, 5-8 r12-r15, 9 mxcsr (low 32) + x87 control word
+//   windows: x86_64 + 10-29 xmm6-xmm15, 30 TIB StackBase, 31 StackLimit, 32 DeallocationStack
+//   aarch64: 4 x30, 5-14 x19-x28, 15-22 d8-d15
+define SP = 0
+define FP = 1
+define PC = 2
+define ARG = 3
+define X86_FP = 9
+#if os == "windows"
+define WORDS = 34
+define X86_FP_DEFAULT = 0x027F00001F80   // MXCSR 0x1F80, x87 CW 0x027F (Windows: 53-bit precision)
+#else
+define WORDS = 24
+define X86_FP_DEFAULT = 0x037F00001F80   // MXCSR 0x1F80, x87 CW 0x037F: the System V defaults
+#endif
+
+/// Moves `v` to the top of a stack that ends at `top`; returns its 16-byte aligned address (the new top).
+export fn stackPlace<F>(top: usize, v: F) -> usize {
+    local slot := (top - sizeOf(F)) & ~(15 as usize)
+    __builtin_write(slot as *F, v)
+    return slot
+}
+
+/// Moves the closure placed by `prepare` off the stack, runs it and drops it.
+fn launch<F>(p: *void) {
+    local f: F = __builtin_read(p as *F)
+    f()
+    panic("xl-fiber: a context's entry closure returned; it must switch away instead")
+}
+
+export class Context {
+    regs: [usize; WORDS]
+
+    /// An empty context; it becomes meaningful once `switchTo` saves into it.
+    fn init(self) { }
+
+    /// Makes the next switch into this context call `entry(arg)` on `stack`, with the stack pointer at `top` (rounded
+    /// down to 16; anything above it, such as a placed closure, is kept). `entry` must never return.
+    fn start(self, stack: *Stack, top: usize, entry: fn(*void), arg: *void) {
+        local sp := top & ~(15 as usize)
+        self.regs[FP] = 0                    // ends the frame chain for the unwinder
+        self.regs[PC] = entry as usize
+        self.regs[ARG] = arg as usize
+#if os == "windows"
+        ((sp - 40) as *usize)[0] = 0         // fake return address, then the caller's 32-byte shadow space
+        self.regs[SP] = sp - 40
+        self.regs[X86_FP] = X86_FP_DEFAULT
+        self.regs[30] = stack.top()          // TIB bounds, swapped in by switchTo so Windows sees the fiber's stack
+        self.regs[31] = stack.base as usize
+        self.regs[32] = stack.base as usize - 4096
+#elif arch == "x86_64"
+        ((sp - 8) as *usize)[0] = 0          // fake return address: entry expects rsp % 16 == 8
+        self.regs[SP] = sp - 8
+        self.regs[X86_FP] = X86_FP_DEFAULT
+#else
+        self.regs[SP] = sp
+        self.regs[4] = 0                     // lr
+#endif
+    }
+
+    /// Saves the running code into `self` and continues `next`.
+    fn switchTo(self, next: *Context) {
+        local a := &self.regs[0] as usize
+        local b := &next.regs[0] as usize
+#if os == "windows"
+        __builtin_asm("mov [rdi], rsp\nmov [rdi + 8], rbp\nlea rax, [rip + 1f]\nmov [rdi + 16], rax\nmov [rdi + 32], rbx\nmov [rdi + 40], r12\nmov [rdi + 48], r13\nmov [rdi + 56], r14\nmov [rdi + 64], r15\nstmxcsr [rdi + 72]\nfnstcw [rdi + 76]\nmovups [rdi + 80], xmm6\nmovups [rdi + 96], xmm7\nmovups [rdi + 112], xmm8\nmovups [rdi + 128], xmm9\nmovups [rdi + 144], xmm10\nmovups [rdi + 160], xmm11\nmovups [rdi + 176], xmm12\nmovups [rdi + 192], xmm13\nmovups [rdi + 208], xmm14\nmovups [rdi + 224], xmm15\nmov rax, qword ptr gs:[8]\nmov [rdi + 240], rax\nmov rax, qword ptr gs:[16]\nmov [rdi + 248], rax\nmov rax, qword ptr gs:[0x1478]\nmov [rdi + 256], rax\nmov rax, [rsi + 240]\nmov qword ptr gs:[8], rax\nmov rax, [rsi + 248]\nmov qword ptr gs:[16], rax\nmov rax, [rsi + 256]\nmov qword ptr gs:[0x1478], rax\nmov rsp, [rsi]\nmov rbp, [rsi + 8]\nmov rbx, [rsi + 32]\nmov r12, [rsi + 40]\nmov r13, [rsi + 48]\nmov r14, [rsi + 56]\nmov r15, [rsi + 64]\nldmxcsr [rsi + 72]\nfldcw [rsi + 76]\nmovups xmm6, [rsi + 80]\nmovups xmm7, [rsi + 96]\nmovups xmm8, [rsi + 112]\nmovups xmm9, [rsi + 128]\nmovups xmm10, [rsi + 144]\nmovups xmm11, [rsi + 160]\nmovups xmm12, [rsi + 176]\nmovups xmm13, [rsi + 192]\nmovups xmm14, [rsi + 208]\nmovups xmm15, [rsi + 224]\nmov rcx, [rsi + 24]\njmp qword ptr [rsi + 16]\n1:",
+                      inout("rdi") a, inout("rsi") b,
+                      clobber("rax"), clobber("rcx"), clobber("rdx"), clobber("r8"), clobber("r9"), clobber("r10"), clobber("r11"),
+                      clobber("xmm0"), clobber("xmm1"), clobber("xmm2"), clobber("xmm3"), clobber("xmm4"), clobber("xmm5"),
+                      clobber("cc"), clobber("memory"))
+#elif arch == "x86_64"
+        __builtin_asm("mov [rdi], rsp\nmov [rdi + 8], rbp\nlea rax, [rip + 1f]\nmov [rdi + 16], rax\nmov [rdi + 32], rbx\nmov [rdi + 40], r12\nmov [rdi + 48], r13\nmov [rdi + 56], r14\nmov [rdi + 64], r15\nstmxcsr [rdi + 72]\nfnstcw [rdi + 76]\nmov rsp, [rsi]\nmov rbp, [rsi + 8]\nmov rbx, [rsi + 32]\nmov r12, [rsi + 40]\nmov r13, [rsi + 48]\nmov r14, [rsi + 56]\nmov r15, [rsi + 64]\nldmxcsr [rsi + 72]\nfldcw [rsi + 76]\nmov rdi, [rsi + 24]\njmp qword ptr [rsi + 16]\n1:",
+                      inout("rdi") a, inout("rsi") b,
+                      clobber("rax"), clobber("rcx"), clobber("rdx"), clobber("r8"), clobber("r9"), clobber("r10"), clobber("r11"),
+                      clobber("xmm0"), clobber("xmm1"), clobber("xmm2"), clobber("xmm3"), clobber("xmm4"), clobber("xmm5"),
+                      clobber("xmm6"), clobber("xmm7"), clobber("xmm8"), clobber("xmm9"), clobber("xmm10"), clobber("xmm11"),
+                      clobber("xmm12"), clobber("xmm13"), clobber("xmm14"), clobber("xmm15"), clobber("cc"), clobber("memory"))
+#elif arch == "aarch64"
+        __builtin_asm("mov x9, sp\nadr x10, 1f\nstp x9, x29, [x0]\nstr x10, [x0, #16]\nstp x30, x19, [x0, #32]\nstp x20, x21, [x0, #48]\nstp x22, x23, [x0, #64]\nstp x24, x25, [x0, #80]\nstp x26, x27, [x0, #96]\nstr x28, [x0, #112]\nstp d8, d9, [x0, #120]\nstp d10, d11, [x0, #136]\nstp d12, d13, [x0, #152]\nstp d14, d15, [x0, #168]\nldp x9, x29, [x1]\nmov sp, x9\nldp x10, x0, [x1, #16]\nldp x30, x19, [x1, #32]\nldp x20, x21, [x1, #48]\nldp x22, x23, [x1, #64]\nldp x24, x25, [x1, #80]\nldp x26, x27, [x1, #96]\nldr x28, [x1, #112]\nldp d8, d9, [x1, #120]\nldp d10, d11, [x1, #136]\nldp d12, d13, [x1, #152]\nldp d14, d15, [x1, #168]\nbr x10\n1:",
+                      inout("x0") a, inout("x1") b,
+                      clobber("x2"), clobber("x3"), clobber("x4"), clobber("x5"), clobber("x6"), clobber("x7"), clobber("x8"),
+                      clobber("x9"), clobber("x10"), clobber("x11"), clobber("x12"), clobber("x13"), clobber("x14"), clobber("x15"),
+                      clobber("x16"), clobber("x17"),
+                      clobber("v0"), clobber("v1"), clobber("v2"), clobber("v3"), clobber("v4"), clobber("v5"), clobber("v6"),
+                      clobber("v7"), clobber("v16"), clobber("v17"), clobber("v18"), clobber("v19"), clobber("v20"), clobber("v21"),
+                      clobber("v22"), clobber("v23"), clobber("v24"), clobber("v25"), clobber("v26"), clobber("v27"), clobber("v28"),
+                      clobber("v29"), clobber("v30"), clobber("v31"), clobber("cc"), clobber("memory"))
+#else
+#error "xl-fiber: unsupported architecture"
+#endif
+    }
+}
+
+impl Context {
+    /// Makes the next switch into this context run `f()` on `stack`. `f` is moved onto the stack itself (nothing is
+    /// allocated) and must never return. The context and the stack must stay put while in use.
+    fn prepare<F>(self: *Context, stack: *Stack, f: F) {
+        local slot := stackPlace(stack.top(), f)
+        local entry: fn(*void) = launch<F>
+        self.start(stack, slot, entry, slot as *void)
+    }
+}
