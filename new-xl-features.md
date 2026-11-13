@@ -1,4 +1,4 @@
-# New xl / xlc features (1.0.0-rc.6)
+# New xl / xlc features (xlc 1.0.0-rc.11, std 1.4.1)
 
 Verified in this project. Short notes only.
 
